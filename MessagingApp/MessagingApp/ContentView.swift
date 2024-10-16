@@ -7,7 +7,10 @@ struct ContentView: View {
     @State private var showSettings: Bool = false
     @State private var encryptionKey: String = ""
     @State private var peerIPAddress: String = ""
-    
+    @State private var showImagePicker: Bool = false
+    @State private var selectedImage: UIImage?
+    @State private var imageDataToSend: Data?
+
     var body: some View {
         NavigationView {
             VStack {
@@ -21,7 +24,7 @@ struct ContentView: View {
                 
                 HStack {
                     Button(action: {
-                        // Implement image picker if needed
+                        showImagePicker = true
                     }) {
                         Image(systemName: "plus")
                             .padding()
@@ -35,7 +38,7 @@ struct ContentView: View {
                 }
                 .padding()
             }
-            .navigationBarTitle("SecureChat")
+            .navigationBarTitle("SecureChat", displayMode: .inline)
             .navigationBarItems(trailing:
                 Button(action: {
                     showSettings = true
@@ -52,6 +55,13 @@ struct ContentView: View {
             }) {
                 SettingsView()
             }
+            .sheet(isPresented: $showImagePicker) {
+                ImagePicker(image: $selectedImage, onImagePicked: { image in
+                    if let imageData = image.jpegData(compressionQuality: 0.8) {
+                        sendImage(imageData)
+                    }
+                })
+            }
             .onAppear {
                 if let key = KeychainHelper.retrieveKey() {
                     encryptionKey = key
@@ -61,10 +71,11 @@ struct ContentView: View {
                 peerIPAddress = UserDefaults.standard.string(forKey: "PeerIPAddress") ?? ""
                 startNetworkServices()
                 NetworkService.shared.onReceiveData = { data in
-                    receiveMessage(data)
+                    receiveData(data)
                 }
             }
         }
+        .navigationViewStyle(StackNavigationViewStyle()) // Ensures consistent navigation view style on iPad
     }
     
     func startNetworkServices() {
@@ -78,18 +89,43 @@ struct ContentView: View {
         guard !messageText.isEmpty else { return }
         guard let key = symmetricKey(from: encryptionKey) else { return }
         if let encryptedData = encryptMessage(messageText, key: key) {
-            NetworkService.shared.send(data: encryptedData)
-            let newMessage = Message(content: messageText, isSentByCurrentUser: true)
-            messages.append(newMessage)
-            messageText = ""
+            let messageWrapper = MessageWrapper(type: .text, content: encryptedData)
+            if let dataToSend = try? JSONEncoder().encode(messageWrapper) {
+                NetworkService.shared.send(data: dataToSend)
+                let newMessage = Message(content: messageText, isSentByCurrentUser: true, type: .text, imageData: nil)
+                messages.append(newMessage)
+                messageText = ""
+            }
         }
     }
     
-    func receiveMessage(_ data: Data) {
+    func sendImage(_ imageData: Data) {
         guard let key = symmetricKey(from: encryptionKey) else { return }
-        if let decryptedMessage = decryptMessage(data, key: key) {
-            let newMessage = Message(content: decryptedMessage, isSentByCurrentUser: false)
-            messages.append(newMessage)
+        if let encryptedData = encryptData(imageData, key: key) {
+            let messageWrapper = MessageWrapper(type: .image, content: encryptedData)
+            if let dataToSend = try? JSONEncoder().encode(messageWrapper) {
+                NetworkService.shared.send(data: dataToSend)
+                let newMessage = Message(content: "", isSentByCurrentUser: true, type: .image, imageData: imageData)
+                messages.append(newMessage)
+            }
+        }
+    }
+    
+    func receiveData(_ data: Data) {
+        guard let key = symmetricKey(from: encryptionKey) else { return }
+        if let messageWrapper: MessageWrapper = try? JSONDecoder().decode(MessageWrapper.self, from: data) {
+            switch messageWrapper.type {
+            case .text:
+                if let decryptedMessage = decryptMessage(messageWrapper.content, key: key) {
+                    let newMessage = Message(content: decryptedMessage, isSentByCurrentUser: false, type: .text, imageData: nil)
+                    messages.append(newMessage)
+                }
+            case .image:
+                if let decryptedData = decryptData(messageWrapper.content, key: key) {
+                    let newMessage = Message(content: "", isSentByCurrentUser: false, type: .image, imageData: decryptedData)
+                    messages.append(newMessage)
+                }
+            }
         }
     }
     
@@ -112,20 +148,31 @@ struct ContentView: View {
 
     func encryptMessage(_ message: String, key: SymmetricKey) -> Data? {
         let messageData = Data(message.utf8)
+        return encryptData(messageData, key: key)
+    }
+    
+    func decryptMessage(_ data: Data, key: SymmetricKey) -> String? {
+        if let decryptedData = decryptData(data, key: key) {
+            return String(data: decryptedData, encoding: .utf8)
+        }
+        return nil
+    }
+    
+    func encryptData(_ data: Data, key: SymmetricKey) -> Data? {
         do {
-            let sealedBox = try AES.GCM.seal(messageData, using: key)
+            let sealedBox = try AES.GCM.seal(data, using: key)
             return sealedBox.combined
         } catch {
             print("Encryption error: \(error)")
             return nil
         }
     }
-
-    func decryptMessage(_ data: Data, key: SymmetricKey) -> String? {
+    
+    func decryptData(_ data: Data, key: SymmetricKey) -> Data? {
         do {
             let sealedBox = try AES.GCM.SealedBox(combined: data)
             let decryptedData = try AES.GCM.open(sealedBox, using: key)
-            return String(data: decryptedData, encoding: .utf8)
+            return decryptedData
         } catch {
             print("Decryption error: \(error)")
             return nil
@@ -133,11 +180,24 @@ struct ContentView: View {
     }
 }
 
-// Message and MessageRow structs remain the same
+// Add the missing MessageWrapper struct
+struct MessageWrapper: Codable {
+    let type: MessageType
+    let content: Data
+}
+
+// Update Message and MessageRow structs
 struct Message: Identifiable {
     let id = UUID()
     let content: String
     let isSentByCurrentUser: Bool
+    let type: MessageType
+    let imageData: Data?
+}
+
+enum MessageType: String, Codable {
+    case text
+    case image
 }
 
 struct MessageRow: View {
@@ -147,13 +207,13 @@ struct MessageRow: View {
         HStack {
             if message.isSentByCurrentUser {
                 Spacer()
-                Text(message.content)
+                contentView
                     .padding()
-                    .background(Color.purple)
+                    .background(Color(hex: "#FF00FF")) // Magenta color using hex value
                     .foregroundColor(.white)
                     .cornerRadius(10)
             } else {
-                Text(message.content)
+                contentView
                     .padding()
                     .background(Color.gray)
                     .foregroundColor(.white)
@@ -162,5 +222,45 @@ struct MessageRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+    
+    @ViewBuilder
+    var contentView: some View {
+        if message.type == .text {
+            Text(message.content)
+        } else if message.type == .image, let imageData = message.imageData, let uiImage = UIImage(data: imageData) {
+            Image(uiImage: uiImage)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 200, maxHeight: 200)
+        } else {
+            Text("Unsupported message type")
+        }
+    }
+}
+
+// Helper extension for hex colors
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int = UInt64()
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 6: // RGB (24-bit)
+            (a, r, g, b) = (255, (int >> 16) & 0xFF, (int >> 8) & 0xFF, int & 0xFF)
+            // Corrected the alpha value to 255 for opaque colors
+        case 8: // ARGB (32-bit)
+            (a, r, g, b) = ((int >> 24) & 0xFF, (int >> 16) & 0xFF, (int >> 8) & 0xFF, int & 0xFF)
+        default:
+            (a, r, g, b) = (255, 255, 0, 255) // Default to opaque magenta
+        }
+        self.init(
+            .sRGB,
+            red: Double(r) / 255,
+            green: Double(g) / 255,
+            blue: Double(b) / 255,
+            opacity: Double(a) / 255
+        )
     }
 }
